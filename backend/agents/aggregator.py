@@ -85,33 +85,40 @@ def score(findings: list[Finding]) -> tuple[float, str]:
     return round(overall, 3), verdict
 
 
-def summary_markdown(review: Review, blocked_actions: int, labels: list[str]) -> str:
+def summary_markdown(review: Review, head_sha: str, blocked_actions: int, labels: list[str], gate: dict | None = None) -> str:
     findings = review.findings
     top = max((f.severity for f in findings), key=lambda s: _RANK[s], default="NONE")
-    critical = sum(f.severity == "CRITICAL" for f in findings)
+    icon = {"CRITICAL": "🛑", "HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡", "INFO": "🔵"}
     lines = [
-        f"**Risk: {top} · {critical} critical · {blocked_actions} blocked action{'s' if blocked_actions != 1 else ''}**",
+        f"## 🛡️ PRGuard review · `{head_sha[:7]}`",
         "",
-        f"PRGuard verdict: `{review.verdict}` · overall confidence {review.overall_confidence:.2f}",
+        f"**Verdict:** `{review.verdict}` · **highest severity:** {top} · **findings:** {len(findings)}"
+        f" · **confidence:** {review.overall_confidence:.2f}",
     ]
+    if gate:
+        lines.append(f"**CI gate:** {'❌ failed' if gate.get('failed') else '✅ passed'} — {gate.get('reason', '')}")
+    if blocked_actions:
+        lines.append(f"**Blocked actions:** {blocked_actions} (refused by PRGuard's access policy)")
     if review.verdict == "NEEDS_HUMAN":
-        lines.append("\nA human needs to look at this before any approval.")
-    tri = review.triage
-    if tri and "error" not in tri:
-        flags = [name for name, key in (("reviewer manipulation", "injection"), ("executes PR code", "executes_pr_code")) if tri[key]["yes"]]
-        lines.append(f"\nTriage (Jev, {tri['ms']} ms): risk {tri['risk']:.1f}/4 ({tri['risk_label']}) · {tri['kind']}"
-                     + (f" · flagged: {', '.join(flags)}" if flags else ""))
+        lines.append("\n> ⚠️ A human needs to look at this: a critical finding, low confidence, or text that tries to "
+                     "instruct AI reviewers.")
     if not findings:
-        lines.append("\nNo findings.")
+        lines.append("\nNo findings. ✅")
     for f in findings:
         where = f"`{f.file_path}:{f.line_start}`" if f.file_path else ""
         agreed = f" · agreed: {', '.join(f.agreed_by)}" if len(f.agreed_by) > 1 else ""
-        lines.append(f"\n- **{f.severity}** [{f.category}] {f.summary} {where}  \n"
-                     f"  {f.rationale}  \n"
-                     f"  _Suggestion:_ {f.suggestion}  \n"
-                     f"  _{f.agent_type} · confidence {f.confidence:.2f} · checker: {f.checker_status}{agreed}_")
-    if review.checker_notes:
-        lines.append(f"\n_Checker: {review.checker_notes}_")
+        lines.append(f"\n<details><summary>{icon.get(f.severity, '')} <b>{f.severity}</b> [{f.category}] {_html(f.summary)} {where}</summary>\n\n"
+                     f"{f.rationale}\n\n**Suggestion:** {f.suggestion or '—'}\n\n"
+                     f"<sub>{f.agent_type} · confidence {f.confidence:.2f} · checker: {f.checker_status}"
+                     f"{(' — ' + _html(f.checker_reason)) if f.checker_reason else ''}{agreed}</sub>\n</details>")
+    notes = [n for n in [review.checker_notes, *review.notes] if n]
+    if notes:
+        lines.append("\n<sub>" + " · ".join(_html(n) for n in notes) + "</sub>")
     if labels:
-        lines.append(f"\n_{' · '.join(labels)}_")
+        lines.append(f"\n<sub>{' · '.join(labels)}</sub>")
+    lines.append("\n<sub>Commands: `/review` · `/describe` · `/improve` · `/ask <question>`</sub>")
     return "\n".join(lines)
+
+
+def _html(text: str) -> str:
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

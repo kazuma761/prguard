@@ -45,7 +45,14 @@ def _log_text(data: Any) -> str:
 
 
 async def run_ci_fixer(ctx: TaskContext, context: dict[str, Any], gateway: ToolGateway) -> tuple[list[Finding], dict[str, Any]]:
-    """Return (findings, info). Empty when CI is green or not readable."""
+    """Return (findings, info). Empty when CI is green or not readable.
+
+    In a pipeline, the failed step's log can be handed in directly
+    (`prguard review --ci-log FILE`, any CI system); otherwise GitHub Actions
+    runs for this exact commit are read through the gateway.
+    """
+    if context.get("ci_log"):
+        return await _explain(ctx, context, context["ci_log"][-12000:], {"source": "ci-log file"})
     scope = {"repo": ctx.repo_full_name}
     try:
         listed = await gateway.call(AGENT_ID, ctx, "list_workflow_runs", {**scope, "head_sha": ctx.head_sha})
@@ -83,16 +90,21 @@ async def run_ci_fixer(ctx: TaskContext, context: dict[str, Any], gateway: ToolG
             suggestion="No code change needed if the re-run passes.", confidence=0.6,
         )], info
 
+    return await _explain(ctx, context, logs, info)
+
+
+async def _explain(ctx: TaskContext, context: dict[str, Any], logs: str, info: dict[str, Any]) -> tuple[list[Finding], dict[str, Any]]:
     if settings.llm_is_mock:
         return mock_findings(logs, context), {**info, "model": "MOCK LLM"}
-
-    user = (prompts.pr_block(context["diff"], context["check_results"], context.get("head_files", {}))
-            + f"\n\n<ci_logs>\n{prompts.defang(logs)}\n</ci_logs>")
+    cfg = context["config"]
+    # Leave room for the log: the diff gets what the log does not use.
+    user = (prompts.pr_block(context["prompt_diff_small"], None, title=context.get("title", ""))
+            + f"\n\n<ci_logs>\n{prompts.defang(logs[-6000:])}\n</ci_logs>")
     result = await llm.chat(
-        settings.provider, settings.llm_model,
-        prompts.specialist_system("ci", ctx.repo_full_name, ctx.pr_number, ctx.head_sha), user,
+        prompts.specialist_system("ci", ctx.repo_full_name, ctx.pr_number, ctx.head_sha, max_findings=3,
+                                  extra_instructions=cfg.review.extra_instructions), user,
     )
-    return specialists.parse_findings(result.text, "ci"), {**info, **result.usage()}
+    return specialists.parse_findings(result.text, "ci")[:3], {**info, **result.usage()}
 
 
 def mock_findings(logs: str, context: dict[str, Any]) -> list[Finding]:

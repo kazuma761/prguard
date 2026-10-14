@@ -1,0 +1,81 @@
+# Copy to .github/workflows/prguard.yml in each repository PRGuard should review.
+#
+# Runs on a self-hosted runner that can reach your model server (llama.cpp,
+# Ollama, vLLM). Build the image on that runner once:  docker build -t prguard:latest .
+#
+# - Pull request opened / pushed: [auto] commands from .prguard.toml
+#   (default: describe + review on open, review on push). The job FAILS when the
+#   review gate fails, so make "PRGuard" a required check in branch protection.
+# - PR comment "/review", "/describe", "/improve", "/ask <question>" from a
+#   member/collaborator runs that command.
+name: PRGuard
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read          # read files and .prguard.toml
+  pull-requests: write    # comments, inline suggestions, PR description
+  issues: write           # PR conversation comments
+  actions: read           # CI fixer: read failed job logs
+  security-events: write  # optional: upload SARIF to code scanning
+
+concurrency:
+  group: prguard-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  prguard:
+    name: PRGuard
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/'))
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 30
+    steps:
+      # Optional: let PRGuard use your pipeline's own test output instead of re-running PR code.
+      # - uses: actions/checkout@v4
+      # - run: pytest -q 2>&1 | tee test-output.txt; echo "__PYTEST_EXIT=${PIPESTATUS[0]}" >> test-output.txt
+      #   (then add  -v "$PWD/test-output.txt:/in/checks.txt:ro"  and  --checks-file /in/checks.txt  below)
+
+      - name: Run PRGuard
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_BASE_URL: ${{ vars.PRGUARD_LLM_BASE_URL || 'http://127.0.0.1:8100/v1' }}
+          LLM_MODEL: ${{ vars.PRGUARD_LLM_MODEL || 'llama-3.1-8b' }}
+          CHECKER_BASE_URL: ${{ vars.PRGUARD_CHECKER_BASE_URL }}
+          CHECKER_MODEL: ${{ vars.PRGUARD_CHECKER_MODEL || 'gemma-4-12b' }}
+          LLM_CONTEXT_TOKENS: ${{ vars.PRGUARD_LLM_CONTEXT_TOKENS || '8192' }}
+        run: |
+          mkdir -p prguard-out
+          docker run --rm --network host --user "$(id -u):$(id -g)" \
+            -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_SERVER_URL -e GITHUB_REPOSITORY \
+            -e GITHUB_EVENT_NAME -e GITHUB_ACTIONS \
+            -e GITHUB_EVENT_PATH=/in/event.json -e GITHUB_STEP_SUMMARY=/out/step-summary.md \
+            -e LLM_BASE_URL -e LLM_MODEL -e CHECKER_BASE_URL -e CHECKER_MODEL -e LLM_CONTEXT_TOKENS \
+            -v "$GITHUB_EVENT_PATH:/in/event.json:ro" \
+            -v "$PWD/prguard-out:/out" \
+            prguard:latest run --out /out
+
+      - name: Job summary
+        if: always()
+        run: cat prguard-out/step-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload SARIF to code scanning
+        if: always() && github.event_name == 'pull_request' && hashFiles('prguard-out/prguard.sarif') != ''
+        continue-on-error: true   # needs code scanning enabled (GitHub Advanced Security on private repos)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: prguard-out/prguard.sarif
+          category: prguard
+
+      - name: Keep the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prguard-${{ github.run_id }}
+          path: prguard-out/
+          if-no-files-found: ignore

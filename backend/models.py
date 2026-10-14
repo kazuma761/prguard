@@ -9,22 +9,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-class Mode(str, Enum):
-    UNSAFE = "UNSAFE"
-    GUARDED = "GUARDED"
-
-
 class Enforcer(str, Enum):
-    AGNTID = "AGNTID"
-    LOCAL_POLICY = "LOCAL_POLICY"
-    NONE = "NONE"
+    POLICY = "POLICY"
 
 
 class TaskContext(BaseModel):
-    """Trusted description of one review.
+    """Trusted description of one job (a review, describe, improve or ask).
 
-    Built only from a verified webhook or an operator-supplied PR URL, never
-    from LLM output or PR content. `human_approved` is flipped only by /approve.
+    Built only from a verified webhook, the CI event file or an operator-supplied
+    PR, never from LLM output or PR content. `human_approved` is flipped only by
+    the /approve endpoint.
     """
 
     review_id: str
@@ -33,12 +27,13 @@ class TaskContext(BaseModel):
     head_sha: str
     base_ref: str = "main"
     sender: str = "unknown"
-    mode: Mode = Mode.GUARDED
+    command: str = "review"
     human_approved: bool = False
 
 
 Severity = Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
 AgentType = Literal["security", "quality", "tests", "docs", "ci"]
+SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
 
 
 class Finding(BaseModel):
@@ -69,7 +64,50 @@ class Review(BaseModel):
     checker_notes: str = ""
     summary_markdown: str = ""
     posted_url: str = ""
-    triage: dict[str, Any] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+class CodeSuggestion(BaseModel):
+    """One /improve suggestion, posted as an inline GitHub suggestion block."""
+
+    file_path: str
+    line_start: int
+    line_end: int
+    existing_code: str = ""
+    improved_code: str
+    summary: str
+    label: str = "maintainability"
+    importance: int = Field(default=5, ge=1, le=10)
+
+
+class Description(BaseModel):
+    """Output of /describe."""
+
+    title: str = ""
+    change_type: list[str] = Field(default_factory=list)
+    summary: str = ""
+    walkthrough: list[dict[str, str]] = Field(default_factory=list)
+    risks: str = ""
+
+
+class CommandResult(BaseModel):
+    """What one command produced, for the CLI, reports and the UI."""
+
+    command: str
+    review_id: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    ok: bool = True
+    error: str = ""
+    review: Review | None = None
+    description: Description | None = None
+    suggestions: list[CodeSuggestion] = Field(default_factory=list)
+    answer: str = ""
+    posted_urls: list[str] = Field(default_factory=list)
+    gate: dict[str, Any] = Field(default_factory=dict)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    duration_s: float = 0.0
 
 
 EventType = Literal[
@@ -79,13 +117,11 @@ EventType = Literal[
     "decision",
     "finding",
     "sandbox",
-    "canary.received",
     "review.posted",
     "hitl.waiting",
     "hitl.approved",
     "review.ready",
-    "triage",
-    "mode.changed",
+    "command.done",
     "error",
 ]
 
@@ -93,7 +129,6 @@ EventType = Literal[
 class Event(BaseModel):
     ts: float = Field(default_factory=time.time)
     review_id: str = ""
-    mode: Mode = Mode.GUARDED
     source: str = ""
     type: EventType
     tool: str | None = None
@@ -116,7 +151,7 @@ class Denial(BaseModel):
     ok: Literal[False] = False
     tool: str
     reason: str
-    enforcer: Enforcer
+    enforcer: Enforcer = Enforcer.POLICY
     policy: str = ""
 
     def __bool__(self) -> bool:
@@ -124,4 +159,4 @@ class Denial(BaseModel):
 
 
 class UpstreamError(Exception):
-    """The call was allowed but the tool server (or GitHub) failed it."""
+    """The call was allowed but GitHub (or the mock) failed it."""

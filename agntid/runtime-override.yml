@@ -1,7 +1,0 @@
-# PRGuard additions to the vendored AgntID runtime compose file.
-# The GitHub token never goes into the AgntID portal: it lives here, on the
-# runtime host, and the portal's MCP server form refers to it as ${GITHUB_TOKEN}.
-services:
-  achr-runtime:
-    environment:
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}

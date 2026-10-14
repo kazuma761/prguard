@@ -1,0 +1,38 @@
+// PRGuard in a Jenkins multibranch pipeline for a GitHub (or GitHub Enterprise) repository.
+// CHANGE_ID is the PR number on PR builds. Credentials: a GitHub token with
+// pull-requests:write, contents:read and actions:read, stored as "prguard-github-token".
+pipeline {
+  agent { label 'gpu' }            // a node that can reach the model server
+  environment {
+    LLM_BASE_URL   = 'http://127.0.0.1:8100/v1'
+    LLM_MODEL      = 'llama-3.1-8b'
+    CHECKER_MODEL  = 'gemma-4-12b'
+    GITHUB_API_URL = 'https://api.github.com'   // GHES: https://ghe.example.com/api/v3
+    REPO           = 'your-org/your-repo'
+  }
+  stages {
+    stage('Tests') {
+      steps {
+        sh 'set +e; pytest -q 2>&1 | tee test-output.txt; echo "__PYTEST_EXIT=${PIPESTATUS[0]}" >> test-output.txt; true'
+      }
+    }
+    stage('PRGuard') {
+      when { changeRequest() }
+      steps {
+        withCredentials([string(credentialsId: 'prguard-github-token', variable: 'GITHUB_TOKEN')]) {
+          sh '''
+            mkdir -p prguard-out
+            docker run --rm --network host --user "$(id -u):$(id -g)" \
+              -e GITHUB_TOKEN -e GITHUB_API_URL \
+              -e LLM_BASE_URL -e LLM_MODEL -e CHECKER_MODEL \
+              -v "$PWD/test-output.txt:/in/checks.txt:ro" -v "$PWD/prguard-out:/out" \
+              prguard:latest review --repo "$REPO" --pr "$CHANGE_ID" --checks-file /in/checks.txt --out /out
+          '''
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'prguard-out/**', allowEmptyArchive: true }
+      }
+    }
+  }
+}

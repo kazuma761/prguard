@@ -1,7 +1,7 @@
 import { Handle, Position, ReactFlow, useNodesState, type Edge, type Node, type NodeProps, type ReactFlowInstance } from "@xyflow/react";
 import { motion } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Ev, Mode } from "./store";
+import type { Ev } from "./store";
 
 const ALLOW = "#22c55e";
 const DENY = "#ef4444";
@@ -19,7 +19,11 @@ const SOURCE_NODE: Record<string, string> = {
   "prguard-docs": "docs",
   "prguard-ci-fixer": "ci",
   "prguard-aggregator": "aggregator",
-  "gemini-checker": "checker",
+  "prguard-checker": "checker",
+  "prguard-config": "orchestrator",
+  "prguard-describer": "aggregator",
+  "prguard-improver": "aggregator",
+  "prguard-asker": "aggregator",
   "hitl-gate": "hitl",
 };
 const SPECIALISTS = ["security", "quality", "tests", "docs", "ci"];
@@ -69,7 +73,7 @@ const POS: Record<string, [number, number]> = {
   github: [870, 460],
 };
 
-export default function FlowGraph({ events, mode, enforcer }: { events: Ev[]; mode: Mode; enforcer: string }) {
+export default function FlowGraph({ events }: { events: Ev[] }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const t = window.setInterval(() => setNow(Date.now()), 200);
@@ -92,37 +96,34 @@ export default function FlowGraph({ events, mode, enforcer }: { events: Ev[]; mo
       if (e.type === "sandbox") {
         if (e.payload.status === "started") open.set("sandbox", 1);
         else open.set("sandbox", 0);
-        sandboxSub = e.payload.status === "unavailable" || e.payload.status === "refused"
-          ? "PR code not run" : e.payload.isolation === "docker" ? "docker · no network" : "host subprocess";
+        sandboxSub = e.payload.status === "unavailable" ? "PR code not run" : "docker · no network";
       }
     }
     return { live: open, flashes, lastDeny, sandboxSub };
   }, [events]);
 
-  const guarded = mode === "GUARDED";
-  const gateLabel = !guarded ? "NO GATE" : enforcer.startsWith("AGNTID") ? "AgntID" : "LOCAL POLICY";
   const recent = (at: number) => now - at < FLASH_MS;
 
   const hitlWaiting = events.some((e) => e.type === "hitl.waiting") && !events.some((e) => e.type === "hitl.approved");
   const data: Record<string, Data> = {
     pr: { label: "PR" },
     orchestrator: { label: "ORCHESTRATOR", sub: "build context" },
-    sandbox: { label: "SANDBOX", sub: sandboxSub || (guarded ? "docker · no network" : "host subprocess"), tone: guarded ? undefined : "deny" },
+    sandbox: { label: "SANDBOX", sub: sandboxSub || "docker · no network" },
     security: { label: "SECURITY" },
     quality: { label: "QUALITY" },
     tests: { label: "TESTS" },
     docs: { label: "DOCS" },
     ci: { label: "CI FIXER", sub: "logs · re-run only" },
-    aggregator: { label: "AGGREGATOR", sub: "merge · score" },
+    aggregator: { label: "PUBLISH", sub: "review · describe · improve" },
     checker: { label: "CHECKER", sub: "maker ≠ checker" },
     hitl: { label: "HITL GATE", tone: hitlWaiting ? "warn" : undefined },
     gate: {
-      label: gateLabel,
-      sub: !guarded ? "broad token · no checks" : enforcer.startsWith("AGNTID") ? "runtime policy" : "stand-in",
-      tone: !guarded ? "deny" : "gate",
+      label: "POLICY GATE",
+      sub: "default deny · per call",
+      tone: "gate",
       shake: recent(lastDeny) ? lastDeny : 0,
     },
-    github: { label: "GITHUB", sub: "MCP server" },
+    github: { label: "GITHUB", sub: "REST · token held here" },
   };
   for (const id of Object.keys(data)) data[id].live = (live.get(id) ?? 0) > 0;
 

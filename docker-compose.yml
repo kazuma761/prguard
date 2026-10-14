@@ -1,10 +1,29 @@
-# Only needed with UPSTREAM=mcp. The backend, canary listener and UI run on the host.
+# PRGuard server mode: GitHub webhook receiver + dashboard on one box.
+#
+#   docker build -t prguard-sandbox backend/sandbox   # the locked container PR code runs in
+#   cp .env.example .env                              # fill in GITHUB_TOKEN, LLM_*, secrets
+#   docker compose up -d --build
+#
+# The Docker socket is mounted ONLY so PRGuard can start the network-less
+# sandbox for PR linters/tests. Access to the socket is root-equivalent on this
+# host: keep this container on a dedicated machine, or set PRGUARD_SANDBOX=0
+# and remove the socket mount (PRGuard then never runs PR code).
 services:
-  github-mcp-server:
-    image: ghcr.io/github/github-mcp-server
-    command: ["http", "--port", "8081"]   # check `--help` for your server version's HTTP flags
+  prguard:
+    build: .
+    image: prguard:latest
+    restart: unless-stopped
+    env_file: .env
     environment:
-      # UNSAFE path only: fine-grained PAT limited to the two throwaway repos.
-      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PAT_UNSAFE:?set GITHUB_PAT_UNSAFE in .env}
+      RUNS_DIR: /var/lib/prguard/runs
+      # Same path on host and in the container, so sandbox bind mounts resolve.
+      SANDBOX_HOST_RUNS_DIR: ${PRGUARD_RUNS_DIR:-/var/lib/prguard/runs}
     ports:
-      - "127.0.0.1:8081:8081"
+      - "${PRGUARD_BIND:-127.0.0.1}:8000:8000"
+    volumes:
+      - ${PRGUARD_RUNS_DIR:-/var/lib/prguard/runs}:/var/lib/prguard/runs
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"   # `getent group docker | cut -d: -f3`
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach llama.cpp on the host: http://host.docker.internal:8100/v1

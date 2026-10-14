@@ -1,10 +1,7 @@
-# PRGuard access policy — human-readable intent.
+# PRGuard access policy. Evaluated in-process by PolicyGateway for EVERY
+# GitHub call an agent makes. Agents never hold the GitHub token.
 #
-# Evaluated locally by LocalPolicyGateway (the stand-in) and to be translated
-# into AgntID's own policy format once we have runtime access.
-#
-# Tool names are PRGuard's logical names (see backend/gateway/toolmap.py), so
-# the policy does not change when the GitHub MCP server renames a tool.
+# Tool names are PRGuard's logical names (see backend/gateway/github.py).
 # `{task.*}` always comes from the trusted TaskContext, never from an agent.
 #
 # Evaluation order (first hit wins):
@@ -21,41 +18,72 @@ always_deny:
     - merge_pull_request
     - push_files
     - delete_file
-    - create_or_update_file   # reviewers never write code
+    - create_or_update_file   # PRGuard never writes code; /improve only *suggests*
+    - update_pull_request     # title, state, base branch: never. /describe uses update_pull_request_body.
   cross_repo: true            # any tool where repo != {task.repo}
 
 profiles:
-  reviewer: &reviewer
+  reader: &reader
     allow:
       - tool: [get_pull_request, get_pull_request_files, get_pull_request_diff]
         where: { repo: "{task.repo}", pull_number: "{task.pr_number}" }
       - tool: get_file_contents
         where: { repo: "{task.repo}", ref: "{task.head_sha}" }
-        deny_paths: [".env*", "**/secrets/**", "**/*.pem", "**/*.key"]
+        deny_paths: [".env*", "**/.env*", "**/secrets/**", "**/*.pem", "**/*.key", "**/id_rsa*"]
       - tool: search_code
         where: { repo: "{task.repo}" }
 
 roles:
-  prguard-orchestrator: *reviewer   # build_context: fetch the PR, nothing else
-  prguard-security: *reviewer
-  prguard-quality: *reviewer
-  prguard-tests: *reviewer
-  prguard-docs: *reviewer
+  prguard-orchestrator: *reader   # builds the context: fetch the PR, nothing else
+  prguard-security: *reader
+  prguard-quality: *reader
+  prguard-tests: *reader
+  prguard-docs: *reader
 
+  # Reads the repo's .prguard.toml from the BASE branch only, so a PR can never
+  # change how it is itself reviewed.
+  prguard-config:
+    allow:
+      - tool: get_file_contents
+        where: { repo: "{task.repo}", ref: "{task.base_ref}" }
+        allow_paths: [".prguard.toml"]
+
+  # /review: one persistent comment, plus an optional formal review.
   prguard-aggregator:
     allow:
+      - tool: upsert_issue_comment
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", marker: review }
       - tool: create_pull_request_review
         where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: [COMMENT, REQUEST_CHANGES] }
       - tool: create_pull_request_review
         where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: APPROVE }
         requires: human_approved
 
+  # /describe: the PR body between PRGuard's markers, or a persistent comment.
+  prguard-describer:
+    allow:
+      - tool: update_pull_request_body
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}" }
+      - tool: upsert_issue_comment
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", marker: describe }
+
+  # /improve: inline suggestion blocks on THIS commit, plus a summary comment.
+  prguard-improver:
+    allow:
+      - tool: create_pull_request_review
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: COMMENT, commit_id: "{task.head_sha}" }
+      - tool: upsert_issue_comment
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", marker: improve }
+
+  # /ask: answers as a new comment on this PR.
+  prguard-asker:
+    allow:
+      - tool: create_issue_comment
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}" }
+
   # CI/CD: may read this repo's workflow runs and logs and re-run failed jobs.
   # It can never change the pipeline: writing any file (including
   # .github/workflows/**) is in always_deny for every role.
-  # Scoped by repo only. The agent's own code keeps to runs for {task.head_sha};
-  # binding a run_id to a commit would need a server-side lookup, which the
-  # stand-in does not do, so the policy does not pretend to enforce it.
   prguard-ci-fixer:
     allow:
       - tool: [list_workflow_runs, get_job_logs, rerun_failed_jobs]

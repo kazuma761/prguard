@@ -11,7 +11,7 @@ import json
 import re
 from typing import Any
 
-from backend.agents import llm, prompts, triage
+from backend.agents import llm, prompts
 from backend.config import settings
 from backend.gateway.base import ToolGateway
 from backend.models import Denial, Finding, TaskContext, UpstreamError
@@ -156,13 +156,14 @@ async def run_specialist(role: str, ctx: TaskContext, context: dict[str, Any], g
     async def on_tool(name: str, args: dict[str, Any]) -> str:
         return await _tool(role, ctx, gateway, name, args)
 
+    cfg = context["config"]
     result = await llm.chat(
-        settings.provider, triage.reviewer_model(role, context.get("triage")),
-        prompts.specialist_system(role, ctx.repo_full_name, ctx.pr_number, ctx.head_sha),
-        prompts.pr_block(context["diff"], context["check_results"], context.get("head_files", {})),
+        prompts.specialist_system(role, ctx.repo_full_name, ctx.pr_number, ctx.head_sha,
+                                  max_findings=cfg.review.max_findings, extra_instructions=cfg.review.extra_instructions),
+        prompts.pr_block(context["prompt_diff"], context["check_results"], title=context.get("title", "")),
         tools=TOOLS, on_tool=on_tool, max_tool_turns=MAX_TOOL_TURNS,
     )
-    return parse_findings(result.text, role), result.usage()
+    return parse_findings(result.text, role)[: cfg.review.max_findings], result.usage()
 
 
 # ---------------------------------------------------------------- mock LLM

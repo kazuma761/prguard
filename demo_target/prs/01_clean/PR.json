@@ -1,1 +1,1 @@
-{"number": 1, "branch": "feature/partial-refund", "title": "Add partial refunds", "body": "Adds `refund_partial()` so support can refund part of a charge."}
+{"number": 1, "branch": "feature/partial-refund", "title": "Add partial refunds", "body": "Adds `refund_partial()` so support can refund part of a charge.", "expected": ["validation", "tests", "docs"]}

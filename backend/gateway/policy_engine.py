@@ -67,6 +67,7 @@ class PolicyEngine:
             "{task.repo}": ctx.repo_full_name,
             "{task.pr_number}": ctx.pr_number,
             "{task.head_sha}": ctx.head_sha,
+            "{task.base_ref}": ctx.base_ref,
         }
         return mapping.get(template, template) if isinstance(template, str) else template
 
@@ -108,6 +109,11 @@ class PolicyEngine:
             blocked = path_denied(str(args.get("path", "")), rule.get("deny_paths") or []) if "path" in args else None
             if blocked:
                 return PolicyDecision(False, f"path {args['path']} matches denied pattern {blocked}", name)
+            only = rule.get("allow_paths")
+            matched = path_denied(str(args.get("path", "")), only) if only is not None else None
+            if only is not None and matched in (None, ".."):  # ".." means traversal, never a match
+                near_miss = near_miss or f"path {args.get('path')!r} is not one of {', '.join(only)}"
+                continue
 
             if rule.get("requires") == "human_approved" and not ctx.human_approved:
                 near_miss = "requires human approval for this task"

@@ -1,0 +1,40 @@
+# .prguard.toml — put this in the root of a repository's DEFAULT branch.
+# PRGuard reads it from the PR's base branch only, so a pull request can never
+# change how it is itself reviewed or gated. Every key is optional.
+
+[review]
+specialists = ["security", "quality", "tests", "docs"]   # drop some to save GPU time
+max_findings = 6              # per specialist
+ci_fixer = true               # explain failed CI runs for this commit
+request_changes = false       # also submit a formal REQUEST_CHANGES review when the verdict says so
+extra_instructions = """
+We use SQLAlchemy 2.x; flag raw SQL string formatting.
+Public API functions in src/api/ need type hints.
+"""
+
+[gate]                        # decides the pipeline exit code of `prguard review`
+fail_on = "HIGH"              # CRITICAL | HIGH | MEDIUM | LOW | INFO | none
+min_confidence = 0.6          # ignore less confident findings when gating
+fail_on_needs_human = false
+fail_on_error = false         # model server down: fail the job (true) or pass with a warning (false)
+
+[describe]
+publish = "body"              # body (PRGuard section in the PR description) | comment
+
+[improve]
+max_suggestions = 5
+min_importance = 4            # 1-10
+
+[auto]                        # what PR events run (server mode and `prguard run`)
+on_open = ["describe", "review"]
+on_push = ["review"]
+
+[commands]                    # who may use /review /describe /improve /ask in PR comments
+allowed_associations = ["OWNER", "MEMBER", "COLLABORATOR"]
+
+[checks]                      # sandbox (--sandbox / server mode): no network, read-only, no host env
+command = "pylint $(find . -name '*.py' -not -path './.*' | head -200); echo __PYLINT_EXIT=$?; python -m pytest -q -p no:cacheprovider; echo __PYTEST_EXIT=$?"
+image = ""                    # default: prguard-sandbox
+
+[ignore]                      # added to the built-in list (lock files, build output, minified, images)
+paths = ["generated/**", "**/*.snap"]

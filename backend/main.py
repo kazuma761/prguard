@@ -1,6 +1,9 @@
-"""PRGuard backend.
+"""PRGuard server: GitHub webhook receiver, API and the Mission Control dashboard.
 
-Run:  uvicorn backend.main:app --host 127.0.0.1 --port 8000
+Run:  prguard serve            (or: uvicorn backend.main:app --host 0.0.0.0 --port 8000)
+
+Webhook (GitHub App or repo webhook, content type application/json, secret =
+GITHUB_WEBHOOK_SECRET) with events "Pull requests" and "Issue comments".
 """
 
 from __future__ import annotations
@@ -8,30 +11,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
-
-import httpx
+import os
+from collections import OrderedDict
 from typing import Any
 
-from fastapi import (
-    BackgroundTasks,
-    FastAPI,
-    HTTPException,
-    Request,
-    WebSocket,
-    WebSocketDisconnect,
-)
+import hmac
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from backend import github_webhook
+from backend import commands, triggers
 from backend.agents import aggregator
 from backend.config import settings
+from backend.context import Options, load_config
 from backend.events import bus
-from backend.gateway import enforcer_label, gateway_for, mock_upstream
-from backend.models import Denial, Event, Mode, Review, TaskContext, UpstreamError
-from backend.orchestrator.graph import ORCHESTRATOR, run_review
-from backend.replay.assume_breach import run_replay
+from backend.gateway import gateway, mock_upstream
+from backend.models import CommandResult, Denial, Event, TaskContext, UpstreamError
+from backend.repo_config import COMMANDS, RepoConfig
 from backend.sandbox.runner import docker_ready
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -40,203 +39,203 @@ log = logging.getLogger("prguard")
 app = FastAPI(title="PRGuard")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[o for o in os.environ.get("PRGUARD_CORS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-current_mode: Mode = Mode.GUARDED
+API_TOKEN = os.environ.get("PRGUARD_API_TOKEN", "").strip()
+
+
+def require_token(request: Request) -> None:
+    """Operator endpoints need PRGUARD_API_TOKEN when it is set (always set it outside localhost)."""
+    if not API_TOKEN:
+        return
+    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip() or request.query_params.get("token", "")
+    if not hmac.compare_digest(supplied, API_TOKEN):
+        raise HTTPException(401, "missing or wrong PRGuard API token")
+
+
+SERVER_SANDBOX = os.environ.get("PRGUARD_SANDBOX", "1").lower() not in ("0", "false", "no")
+MAX_JOBS = 200
 contexts: dict[str, TaskContext] = {}
-reviews: dict[str, Review] = {}
-seen_deliveries: set[str] = set()
+results: "OrderedDict[str, CommandResult]" = OrderedDict()
+seen_deliveries: "OrderedDict[str, None]" = OrderedDict()
+_lock = asyncio.Lock()  # one job at a time: the GPU is the bottleneck anyway
 
 
-async def _review_task(ctx: TaskContext) -> None:
-    contexts[ctx.review_id] = ctx
-    try:
-        reviews[ctx.review_id] = await run_review(ctx)
-    except Exception as exc:
-        log.exception("review %s failed", ctx.review_id)
-        bus.emit(Event(type="error", review_id=ctx.review_id, mode=ctx.mode, source="pr", reason=f"review failed: {exc}"))
+async def _run_job(ctx: TaskContext, command_list: list[str], cfg: RepoConfig | None, question: str = "",
+                   publish: bool = True) -> None:
+    async with _lock:
+        for command in command_list:
+            job_ctx = ctx.model_copy(update={"review_id": triggers.new_review_id(), "command": command})
+            contexts[job_ctx.review_id] = job_ctx
+            try:
+                result = await commands.run(job_ctx, command, Options(publish=publish, sandbox=SERVER_SANDBOX, question=question), cfg)
+            except Exception as exc:
+                log.exception("job %s failed", job_ctx.review_id)
+                bus.emit(Event(type="error", review_id=job_ctx.review_id, source="pr", reason=f"{command} failed: {exc}"))
+                continue
+            results[job_ctx.review_id] = result
+            while len(results) > MAX_JOBS:
+                old, _ = results.popitem(last=False)
+                contexts.pop(old, None)
 
 
-async def _context_for_pr(repo: str, number: int, mode: Mode, prefix: str = "") -> TaskContext:
-    """Build a TaskContext for an operator-chosen PR. Head SHA and author come from GitHub."""
-    if repo != settings.target_repo:
-        raise HTTPException(400, f"PRGuard only reviews {settings.target_repo}")
-    # A separate, short-lived task just to look the PR up: its head commit is not
-    # known yet, and the review task should name the exact commit.
-    gateway = gateway_for(mode)
-    probe = TaskContext(review_id="lookup-" + github_webhook.new_review_id(), repo_full_name=repo, pr_number=number,
-                        head_sha="", mode=mode)
-    try:
-        res = await gateway.call(ORCHESTRATOR, probe, "get_pull_request", {"repo": repo, "pull_number": number})
-    except UpstreamError as exc:
-        raise HTTPException(502, f"could not load the pull request: {exc}") from exc
-    finally:
-        closer = getattr(gateway, "close_review", None)
-        if closer:
-            await closer(probe)
-    if isinstance(res, Denial):
-        raise HTTPException(403, f"access control refused the pull request lookup: {res.reason}")
-    if not isinstance(res.data, dict) or "head" not in res.data:
-        raise HTTPException(502, "could not load the pull request")
-    pr = res.data
-    return probe.model_copy(update={
-        "review_id": prefix + github_webhook.new_review_id(),
-        "head_sha": pr["head"]["sha"],
-        "base_ref": pr.get("base", {}).get("ref", "main"),
-        "sender": pr.get("user", {}).get("login", "unknown"),
-    })
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
 
 
-_pr_cache: dict[str, Any] = {"at": 0.0, "prs": []}
-
-
-async def _list_prs() -> list[dict[str, Any]]:
-    """PRs for the selector. Mock fixtures offline; the public GitHub API otherwise (cached a minute)."""
-    if settings.upstream == "mock":
-        return [{"number": n, "title": m["title"]} for n, m in sorted(mock_upstream().prs.items())]
-    if time.time() - _pr_cache["at"] > 60:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                response = await client.get(f"https://api.github.com/repos/{settings.target_repo}/pulls",
-                                            params={"state": "open", "per_page": 30, "sort": "created", "direction": "asc"})
-            if response.status_code == 200:
-                _pr_cache.update(at=time.time(), prs=[{"number": p["number"], "title": p["title"]} for p in response.json()])
-        except httpx.HTTPError:
-            pass
-    return _pr_cache["prs"]
-
-
-@app.get("/state")
+@app.get("/state", dependencies=[Depends(require_token)])
 async def state() -> dict[str, Any]:
-    prs = await _list_prs()
+    prs = [{"number": n, "title": m["title"]} for n, m in sorted(mock_upstream().prs.items())] if settings.upstream == "mock" else []
     return {
-        "mode": current_mode.value,
-        "enforcer": enforcer_label(current_mode),
+        "enforcer": "POLICY",
         "upstream": settings.upstream,
         "llm": "MOCK LLM" if settings.llm_is_mock else settings.llm_model,
-        "checker": settings.checker[1] if settings.checker else "not configured",
-        "target_repo": settings.target_repo,
+        "llm_url": settings.llm_base_url,
+        "checker": settings.checker[2] if settings.checker else "not configured",
+        "target_repo": settings.target_repo if settings.upstream == "mock" else "",
+        "allowed_repos": settings.allowed_repos,
         "prs": prs,
-        "sandbox": await docker_ready() or "ready",
+        "sandbox": (await docker_ready() or "ready") if SERVER_SANDBOX else "disabled",
+        "commands": list(COMMANDS),
     }
 
 
-class ModeBody(BaseModel):
-    mode: Mode
+@app.get("/jobs", dependencies=[Depends(require_token)])
+async def jobs() -> list[dict[str, Any]]:
+    return [{"review_id": r.review_id, "command": r.command, "repo": r.repo, "pr": r.pr_number, "ok": r.ok,
+             "error": r.error, "gate": r.gate, "posted": r.posted_urls, "seconds": r.duration_s,
+             "verdict": r.review.verdict if r.review else None} for r in reversed(results.values())]
 
 
-@app.post("/mode")
-async def set_mode(body: ModeBody) -> dict[str, Any]:
-    global current_mode
-    current_mode = body.mode
-    bus.emit(Event(type="mode.changed", mode=current_mode, source="operator", payload={"enforcer": enforcer_label(current_mode)}))
-    return {"mode": current_mode.value, "enforcer": enforcer_label(current_mode)}
+class RunBody(BaseModel):
+    pr_url: str | None = None
+    repo: str | None = None
+    pr_number: int | None = None
+    command: str = "review"
+    question: str = ""
+    publish: bool = True
 
 
+@app.post("/run", dependencies=[Depends(require_token)])
+async def run(body: RunBody, background: BackgroundTasks) -> dict[str, Any]:
+    if body.command not in COMMANDS:
+        raise HTTPException(400, f"command must be one of {COMMANDS}")
+    if body.pr_url:
+        parsed = triggers.parse_pr_url(body.pr_url)
+        if not parsed:
+            raise HTTPException(400, "pr_url must look like https://github.com/owner/repo/pull/123")
+        repo, number = parsed
+    elif body.pr_number:
+        repo, number = body.repo or settings.target_repo, body.pr_number
+    else:
+        raise HTTPException(400, "give pr_url, or repo and pr_number")
+    if settings.upstream != "mock" and not settings.repo_allowed(repo):
+        raise HTTPException(403, f"{repo} is not in PRGUARD_ALLOWED_REPOS")
+    try:
+        ctx = await triggers.context_for_pr(gateway(), repo, number, sender="operator")
+    except UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    background.add_task(_run_job, ctx, [body.command], None, body.question, body.publish)
+    return {"queued": body.command, "repo": repo, "pr": number, "head_sha": ctx.head_sha}
+
+
+# Kept for the dashboard's "Run review" button.
 class ReviewBody(BaseModel):
     pr_url: str | None = None
     pr_number: int | None = None
 
 
-@app.post("/review")
+@app.post("/review", dependencies=[Depends(require_token)])
 async def review(body: ReviewBody, background: BackgroundTasks) -> dict[str, Any]:
-    if body.pr_url:
-        parsed = github_webhook.parse_pr_url(body.pr_url)
-        if not parsed:
-            raise HTTPException(400, "pr_url must look like https://github.com/owner/repo/pull/123")
-        repo, number = parsed
-    elif body.pr_number:
-        repo, number = settings.target_repo, body.pr_number
-    else:
-        raise HTTPException(400, "give pr_url or pr_number")
-    ctx = await _context_for_pr(repo, number, current_mode)
-    background.add_task(_review_task, ctx)
-    return {"review_id": ctx.review_id, "mode": ctx.mode.value}
+    return await run(RunBody(pr_url=body.pr_url, pr_number=body.pr_number), background)
 
 
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks) -> dict[str, Any]:
     body = await request.body()
-    if not github_webhook.verify_signature(settings.github_webhook_secret, body, request.headers.get("X-Hub-Signature-256")):
+    if not triggers.verify_signature(settings.github_webhook_secret, body, request.headers.get("X-Hub-Signature-256")):
         raise HTTPException(401, "bad signature")
     delivery = request.headers.get("X-GitHub-Delivery", "")
     if delivery in seen_deliveries:
         return {"status": "duplicate"}
-    seen_deliveries.add(delivery)
-    if request.headers.get("X-GitHub-Event") != "pull_request":
-        return {"status": "ignored"}
-    ctx = github_webhook.context_from_webhook(json.loads(body), current_mode)
-    if ctx is None or ctx.repo_full_name != settings.target_repo:
-        return {"status": "ignored"}
-    background.add_task(_review_task, ctx)
-    return {"status": "queued", "review_id": ctx.review_id}
+    seen_deliveries[delivery] = None
+    while len(seen_deliveries) > 5000:
+        seen_deliveries.popitem(last=False)
+    event = request.headers.get("X-GitHub-Event", "")
+    if event == "ping":
+        return {"status": "pong"}
+    payload = json.loads(body)
+    repo = (payload.get("repository") or {}).get("full_name", "")
+    if not settings.repo_allowed(repo):
+        return {"status": "ignored", "reason": f"{repo} is not in PRGUARD_ALLOWED_REPOS"}
+    try:
+        job, reason = await triggers.job_from_event(event, payload, gateway())
+    except UpstreamError as exc:
+        return {"status": "error", "reason": str(exc)}
+    if job is None:
+        return {"status": "ignored", "reason": reason}
+    background.add_task(_run_job, job.ctx, job.commands, job.cfg, job.question)
+    return {"status": "queued", "commands": job.commands, "trigger": job.trigger}
 
 
-@app.post("/approve/{review_id}")
+@app.post("/approve/{review_id}", dependencies=[Depends(require_token)])
 async def approve(review_id: str) -> dict[str, Any]:
-    ctx, rev = contexts.get(review_id), reviews.get(review_id)
-    if ctx is None or rev is None:
+    ctx, result = contexts.get(review_id), results.get(review_id)
+    if ctx is None or result is None or result.review is None:
         raise HTTPException(404, "unknown or unfinished review")
-    if rev.verdict != "NEEDS_HUMAN":
+    if result.review.verdict != "NEEDS_HUMAN":
         raise HTTPException(409, "this review is not waiting for a human")
     # Runtime permission change, scoped to this one task.
     ctx.human_approved = True
-    bus.emit(Event(type="hitl.approved", review_id=review_id, mode=ctx.mode, source="operator",
+    bus.emit(Event(type="hitl.approved", review_id=review_id, source="operator",
                    reason=f"human approved; APPROVE unlocked for {ctx.repo_full_name}#{ctx.pr_number} only"))
     args = {"repo": ctx.repo_full_name, "pull_number": ctx.pr_number, "event": "APPROVE",
-            "body": "Approved by a human reviewer via PRGuard.\n\n" + rev.summary_markdown}
+            "body": "Approved by a human reviewer via PRGuard."}
     try:
-        result = await gateway_for(ctx.mode).call(aggregator.AGENT_ID, ctx, "create_pull_request_review", args)
+        res = await gateway().call(aggregator.AGENT_ID, ctx, "create_pull_request_review", args)
     except UpstreamError as exc:
-        # e.g. GitHub does not let an account approve its own pull request.
-        return {"approved": True, "posted": False, "reason": f"allowed by access control, refused by GitHub: {exc}"}
-    if isinstance(result, Denial):
-        return {"approved": True, "posted": False, "reason": result.reason}
-    url = result.data.get("html_url", "") if isinstance(result.data, dict) else ""
-    bus.emit(Event(type="review.posted", review_id=review_id, mode=ctx.mode, source=aggregator.AGENT_ID,
-                   payload={"url": url, "event": "APPROVE"}))
+        return {"approved": True, "posted": False, "reason": f"allowed by policy, refused by GitHub: {exc}"}
+    if isinstance(res, Denial):
+        return {"approved": True, "posted": False, "reason": res.reason}
+    url = res.data.get("html_url", "") if isinstance(res.data, dict) else ""
+    bus.emit(Event(type="review.posted", review_id=review_id, source=aggregator.AGENT_ID, payload={"url": url, "event": "APPROVE"}))
     return {"approved": True, "posted": True, "url": url}
 
 
-@app.post("/replay")
-async def replay(agent: str = "prguard-security", pr: int = 2) -> dict[str, Any]:
-    # Always a fresh task, so an approval given to a real review never carries over.
-    ctx = await _context_for_pr(settings.target_repo, pr, current_mode, prefix="replay-")
-    results = await run_replay(agent, ctx, gateway_for(ctx.mode))
-    return {"review_id": ctx.review_id, "mode": ctx.mode.value, "enforcer": enforcer_label(ctx.mode), "results": results}
-
-
-@app.post("/reset")
+@app.post("/reset", dependencies=[Depends(require_token)])
 async def reset() -> dict[str, Any]:
-    """Clear the event feed and, with the mock upstream, undo recorded writes."""
-    for ctx in list(contexts.values()):
-        closer = getattr(gateway_for(ctx.mode), "close_review", None)
-        if closer:  # AgntID: close the review's delegations and task
-            await closer(ctx)
+    """Clear the dashboard feed (and recorded writes when using the mock GitHub)."""
     bus.clear()
-    contexts.clear()
-    reviews.clear()
-    mock_upstream().reset()
+    if settings.upstream == "mock":
+        mock_upstream().reset()
     return {"ok": True}
 
 
-@app.post("/internal/canary")
-async def canary(request: Request) -> dict[str, Any]:
-    if request.client is None or request.client.host not in ("127.0.0.1", "::1"):
-        raise HTTPException(403, "localhost only")
-    record = await request.json()
-    latest = next((e for e in reversed(bus.history) if e.source == "sandbox" and e.review_id), None)
-    bus.emit(Event(type="canary.received", review_id=latest.review_id if latest else "", mode=latest.mode if latest else current_mode,
-                   source="canary-listener",
-                   payload={"env_names": record.get("env_names", []), "canary": record.get("canary")}))
-    return {"ok": True}
+@app.get("/config/{owner}/{name}/{pr}", dependencies=[Depends(require_token)])
+async def show_config(owner: str, name: str, pr: int) -> dict[str, Any]:
+    """The effective .prguard.toml for a PR (read from its base branch)."""
+    repo = f"{owner}/{name}"
+    if settings.upstream != "mock" and not settings.repo_allowed(repo):
+        raise HTTPException(403, f"{repo} is not in PRGUARD_ALLOWED_REPOS")
+    try:
+        ctx = await triggers.context_for_pr(gateway(), repo, pr)
+    except UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    cfg = await load_config(ctx, gateway())
+    from dataclasses import asdict
+
+    return asdict(cfg)
 
 
 @app.websocket("/ws")
 async def ws(socket: WebSocket) -> None:
+    if API_TOKEN and not hmac.compare_digest(socket.query_params.get("token", ""), API_TOKEN):
+        await socket.close(code=4401)
+        return
     await socket.accept()
     queue = bus.subscribe()
     try:
@@ -249,3 +248,12 @@ async def ws(socket: WebSocket) -> None:
         pass
     finally:
         bus.unsubscribe(queue)
+
+
+# The built dashboard (frontend/dist), served at / when present.
+if (settings.ui_dist_dir / "index.html").is_file():
+    app.mount("/assets", StaticFiles(directory=settings.ui_dist_dir / "assets"), name="assets")
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(settings.ui_dist_dir / "index.html")

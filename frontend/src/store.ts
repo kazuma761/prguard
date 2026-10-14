@@ -1,13 +1,24 @@
 import { useEffect, useReducer, useState } from "react";
 
-export const API = (import.meta.env.VITE_API as string | undefined) ?? "http://127.0.0.1:8000";
+// Served by the PRGuard server: same origin. Vite dev server (:5173): the API on :8000.
+export const API = (import.meta.env.VITE_API as string | undefined)
+  ?? (window.location.port === "5173" ? "http://127.0.0.1:8000" : window.location.origin);
 
-export type Mode = "UNSAFE" | "GUARDED";
+/** Optional PRGUARD_API_TOKEN, remembered in this browser. */
+export function token(): string {
+  try { return localStorage.getItem("prguard_token") ?? ""; } catch { return ""; }
+}
+export function setToken(value: string) {
+  try { localStorage.setItem("prguard_token", value); } catch { /* storage blocked */ }
+}
+function authHeaders(): Record<string, string> {
+  const t = token();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
 
 export interface Ev {
   ts: number;
   review_id: string;
-  mode: Mode;
   source: string;
   type: string;
   tool?: string | null;
@@ -39,18 +50,33 @@ export interface Review {
   verdict: "COMMENT" | "REQUEST_CHANGES" | "NEEDS_HUMAN";
   checker_notes: string;
   posted_url: string;
-  triage?: { error?: string; risk?: number; risk_label?: string; kind?: string; ms?: number; route?: string; needs_human?: boolean; injection?: { yes: boolean }; executes_pr_code?: { yes: boolean } };
+  notes?: string[];
 }
 
 export interface ServerState {
-  mode: Mode;
   enforcer: string;
   upstream: string;
   llm: string;
+  llm_url: string;
   checker: string;
   target_repo: string;
+  allowed_repos: string;
   prs: { number: number; title: string }[];
   sandbox: string;
+  commands: string[];
+}
+
+export interface Job {
+  review_id: string;
+  command: string;
+  repo: string;
+  pr: number;
+  ok: boolean;
+  error: string;
+  gate: { failed?: boolean; reason?: string };
+  posted: string[];
+  seconds: number;
+  verdict: string | null;
 }
 
 interface Store {
@@ -76,7 +102,8 @@ export function useEvents() {
     let timer: number | undefined;
 
     const connect = () => {
-      const ws = new WebSocket(API.replace(/^http/, "ws") + "/ws");
+      const t = token();
+      const ws = new WebSocket(API.replace(/^http/, "ws") + "/ws" + (t ? `?token=${encodeURIComponent(t)}` : ""));
       socket = ws;
       ws.onopen = () => {
         if (closed.current) return ws.close();
@@ -107,7 +134,7 @@ export function useEvents() {
 export async function post(path: string, body?: unknown) {
   const res = await fetch(API + path, {
     method: "POST",
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...authHeaders() },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
@@ -115,26 +142,31 @@ export async function post(path: string, body?: unknown) {
   return data;
 }
 
-export async function getState(): Promise<ServerState> {
-  return (await fetch(API + "/state")).json();
+export async function get<T>(path: string): Promise<T> {
+  const res = await fetch(API + path, { headers: authHeaders() });
+  if (res.status === 401) throw new Error("401");
+  return res.json();
 }
 
-/** Events belonging to the most recent run (a review or a replay). */
+export const getState = () => get<ServerState>("/state");
+export const getJobs = () => get<Job[]>("/jobs");
+
+/** Events belonging to the most recent command of any kind. */
 export function latestRun(events: Ev[]): { id: string; events: Ev[] } {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
-    if (e.type === "span.start" && (e.source === "pr" || e.source === "replay")) {
+    if (e.type === "span.start" && e.source === "pr") {
       return { id: e.review_id, events: events.filter((x) => x.review_id === e.review_id) };
     }
   }
   return { id: "", events: [] };
 }
 
-/** The most recent real review (not a replay). */
+/** The most recent /review. */
 export function latestReview(events: Ev[]): { id: string; events: Ev[] } {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
-    if (e.type === "span.start" && e.source === "pr") {
+    if (e.type === "span.start" && e.source === "pr" && (e.payload.command ?? "review") === "review") {
       return { id: e.review_id, events: events.filter((x) => x.review_id === e.review_id) };
     }
   }

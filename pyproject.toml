@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prguard"
+version = "1.0.0"
+description = "Local, policy-guarded AI pull-request reviewer for CI/CD pipelines"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115", "httpx>=0.27", "langgraph>=1.0", "pydantic>=2.8", "python-dotenv>=1.0",
+  "pyyaml>=6.0", "uvicorn>=0.30", "websockets>=13",
+]
+
+[project.scripts]
+prguard = "backend.cli:main"
+
+[tool.setuptools]
+packages = ["backend", "backend.agents", "backend.gateway", "backend.orchestrator", "backend.sandbox"]
+
+[tool.setuptools.package-data]
+backend = ["policies/*.yaml"]
+
+[tool.ruff]
+line-length = 130

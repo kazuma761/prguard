@@ -1,4 +1,9 @@
-"""Settings, read once from the environment (.env is loaded if present)."""
+"""Settings, read once from the environment (.env is loaded if present).
+
+Everything runs locally: the reviewers and the checker talk to any
+OpenAI-compatible server (llama.cpp, Ollama, vLLM, LM Studio), and GitHub is
+reached directly over its REST API (github.com or GitHub Enterprise Server).
+"""
 
 from __future__ import annotations
 
@@ -16,89 +21,105 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+def _flag(name: str, default: bool) -> bool:
+    value = _env(name)
+    if not value:
+        return default
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _int(name: str, default: int) -> int:
+    try:
+        return int(_env(name) or default)
+    except ValueError:
+        return default
+
+
 @dataclass
 class Settings:
-    # Reviewers. LLM_PROVIDER empty = auto (openrouter, then anthropic, else mock).
+    # ---- models (any OpenAI-compatible endpoint) -------------------------
+    # LLM_PROVIDER: "local" (default when LLM_BASE_URL is set) or "mock".
     llm_provider: str = field(default_factory=lambda: _env("LLM_PROVIDER").lower())
+    llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL").rstrip("/"))
+    llm_api_key: str = field(default_factory=lambda: _env("LLM_API_KEY"))
     llm_model: str = field(default_factory=lambda: _env("LLM_MODEL"))
-    openrouter_api_key: str = field(default_factory=lambda: _env("OPENROUTER_API_KEY"))
-    # How OpenRouter picks a provider: throughput | latency | price | "" (its default).
-    openrouter_sort: str = field(default_factory=lambda: _env("OPENROUTER_SORT", "throughput").lower())
-    anthropic_api_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
-    # Independent checker: a different model family from the reviewers.
-    checker_provider: str = field(default_factory=lambda: _env("CHECKER_PROVIDER").lower())
-    checker_model: str = field(default_factory=lambda: _env("CHECKER_MODEL") or _env("GEMINI_MODEL"))
-    gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY"))
-    # TypeSafe Jev: one fast typed-classifier call per PR (optional).
-    jev_api_key: str = field(default_factory=lambda: _env("JEV_API_KEY"))
-    jev_model: str = field(default_factory=lambda: _env("JEV_MODEL", "jev-latest"))
-    llm_model_strong: str = field(default_factory=lambda: _env("LLM_MODEL_STRONG"))
-    # Replay identical LLM requests from disk: deterministic demos, no repeat cost.
-    llm_cache: bool = field(default_factory=lambda: _env("LLM_CACHE", "1") not in ("0", "false", "no"))
+    # Independent checker: ideally a different model family from the reviewers.
+    # CHECKER_BASE_URL defaults to LLM_BASE_URL (one server can host both models).
+    checker_base_url: str = field(default_factory=lambda: _env("CHECKER_BASE_URL").rstrip("/"))
+    checker_api_key: str = field(default_factory=lambda: _env("CHECKER_API_KEY"))
+    checker_model: str = field(default_factory=lambda: _env("CHECKER_MODEL"))
+    # Context window of the served model (llama.cpp: per-slot ctx = --ctx-size / --parallel).
+    llm_context_tokens: int = field(default_factory=lambda: _int("LLM_CONTEXT_TOKENS", 8192))
+    llm_max_output_tokens: int = field(default_factory=lambda: _int("LLM_MAX_OUTPUT_TOKENS", 1500))
+    # How many requests PRGuard sends at once. Keep it low on a shared GPU.
+    llm_concurrency: int = field(default_factory=lambda: _int("LLM_CONCURRENCY", 2))
+    llm_timeout_s: float = field(default_factory=lambda: float(_env("LLM_TIMEOUT_S") or 180))
+    # Ask the server for a JSON object (llama.cpp, Ollama and vLLM support it).
+    llm_json_mode: bool = field(default_factory=lambda: _flag("LLM_JSON_MODE", True))
+    # Let specialists call read-only tools. Off by default: small models are
+    # unreliable at tool use, and llama.cpp needs --jinja for it.
+    llm_tools: bool = field(default_factory=lambda: _flag("LLM_TOOLS", False))
+    # Replay identical LLM requests from disk (deterministic re-runs, no repeat cost).
+    llm_cache: bool = field(default_factory=lambda: _flag("LLM_CACHE", False))
 
-    # LOCAL_POLICY (stand-in) | AGNTID. Only used in GUARDED mode.
-    enforcer: str = field(default_factory=lambda: _env("ENFORCER", "LOCAL_POLICY").upper())
-    agntid_proxy_url: str = field(default_factory=lambda: _env("AGNTID_PROXY_URL", "http://localhost:8082/mcp"))
-    agntid_access_token: str = field(default_factory=lambda: _env("AGNTID_ACCESS_TOKEN"))
-
-    # mcp = real GitHub MCP server, mock = offline fixtures from demo_target/.
-    upstream: str = field(default_factory=lambda: _env("UPSTREAM", "mock").lower())
-    github_mcp_url: str = field(default_factory=lambda: _env("GITHUB_MCP_URL", "http://localhost:8081/mcp"))
-    github_pat_unsafe: str = field(default_factory=lambda: _env("GITHUB_PAT_UNSAFE"))
+    # ---- GitHub ----------------------------------------------------------
+    # github = real GitHub REST API, mock = offline fixtures from demo_target/.
+    upstream: str = field(default_factory=lambda: _env("UPSTREAM", "github").lower())
+    github_token: str = field(default_factory=lambda: _env("GITHUB_TOKEN"))
+    # GitHub Actions sets both; for GitHub Enterprise Server use https://ghe.example.com/api/v3.
+    github_api_url: str = field(default_factory=lambda: _env("GITHUB_API_URL", "https://api.github.com").rstrip("/"))
+    github_server_url: str = field(default_factory=lambda: _env("GITHUB_SERVER_URL", "https://github.com").rstrip("/"))
+    # Login PRGuard posts as. Used to find its own persistent comments; GitHub
+    # App / Actions tokens cannot call /user, so this is the fallback.
+    github_bot_login: str = field(default_factory=lambda: _env("GITHUB_BOT_LOGIN", "github-actions[bot]"))
     github_webhook_secret: str = field(default_factory=lambda: _env("GITHUB_WEBHOOK_SECRET"))
+    # Server mode: comma-separated repos the webhook may act on ("*" = any repo the token can reach).
+    allowed_repos: str = field(default_factory=lambda: _env("PRGUARD_ALLOWED_REPOS", "*"))
+    # Offline demo / tests only.
+    target_repo: str = field(default_factory=lambda: _env("TARGET_REPO", "demo/prguard-demo-target"))
+    other_repo: str = field(default_factory=lambda: _env("OTHER_REPO", "demo/prguard-demo-other"))
 
-    target_repo: str = field(default_factory=lambda: _env("TARGET_REPO", "you/prguard-demo-target"))
-    other_repo: str = field(default_factory=lambda: _env("OTHER_REPO", "you/prguard-demo-other"))
-    # UNSAFE mode runs PR code on this machine, so it only does that for PRs
-    # opened by these logins. Defaults to the owner of TARGET_REPO.
-    unsafe_allowed_authors: str = field(default_factory=lambda: _env("UNSAFE_ALLOWED_AUTHORS"))
-
-    hitl_threshold: float = field(default_factory=lambda: float(_env("HITL_THRESHOLD", "0.7")))
-    canary_url: str = field(default_factory=lambda: _env("CANARY_URL", "http://127.0.0.1:9999/canary"))
+    # ---- sandbox (runs the PR's linters/tests with no network) -------------
     sandbox_image: str = field(default_factory=lambda: _env("SANDBOX_IMAGE", "prguard-sandbox"))
-    node_timeout_s: float = field(default_factory=lambda: float(_env("NODE_TIMEOUT_S", "45")))
+    sandbox_timeout_s: int = field(default_factory=lambda: _int("SANDBOX_TIMEOUT_S", 120))
+    # When PRGuard itself runs in a container and starts the sandbox as a sibling
+    # container through the Docker socket, bind mounts are resolved on the HOST.
+    # Set this to the host path of RUNS_DIR so checkouts can be mounted.
+    sandbox_host_runs_dir: str = field(default_factory=lambda: _env("SANDBOX_HOST_RUNS_DIR"))
 
-    runs_dir: Path = ROOT / "runs"
-    policy_path: Path = ROOT / "backend" / "policies" / "prguard.policy.yaml"
+    hitl_threshold: float = field(default_factory=lambda: float(_env("HITL_THRESHOLD") or 0.7))
+    node_timeout_s: float = field(default_factory=lambda: float(_env("NODE_TIMEOUT_S") or 300))
+
+    runs_dir: Path = field(default_factory=lambda: Path(_env("RUNS_DIR") or ROOT / "runs"))
+    policy_path: Path = field(default_factory=lambda: Path(_env("POLICY_PATH") or ROOT / "backend" / "policies" / "prguard.policy.yaml"))
     demo_target_dir: Path = ROOT / "demo_target"
+    ui_dist_dir: Path = field(default_factory=lambda: Path(_env("UI_DIST_DIR") or ROOT / "frontend" / "dist"))
 
     @property
     def provider(self) -> str:
-        """Which backend the reviewers use: openrouter | anthropic | mock."""
-        if self.llm_provider in ("openrouter", "anthropic", "mock"):
-            wanted = self.llm_provider
-        elif self.openrouter_api_key:
-            wanted = "openrouter"
-        elif self.anthropic_api_key:
-            wanted = "anthropic"
-        else:
-            wanted = "mock"
-        key = {"openrouter": self.openrouter_api_key, "anthropic": self.anthropic_api_key}.get(wanted, "x")
-        return wanted if key and (self.llm_model or wanted == "mock") else "mock"
+        """Which backend the reviewers use: local | mock."""
+        if self.llm_provider == "mock":
+            return "mock"
+        return "local" if self.llm_base_url and self.llm_model else "mock"
 
     @property
     def llm_is_mock(self) -> bool:
         return self.provider == "mock"
 
     @property
-    def checker(self) -> tuple[str, str] | None:
-        """(provider, model) for the independent checker, or None if not configured."""
-        if not self.checker_model or self.checker_provider == "none":
+    def checker(self) -> tuple[str, str, str] | None:
+        """(base_url, api_key, model) for the independent checker, or None."""
+        if self.llm_is_mock or not self.checker_model or self.checker_model.lower() == "none":
             return None
-        if self.checker_provider == "gemini" or (not self.checker_provider and self.gemini_api_key):
-            return ("gemini", self.checker_model) if self.gemini_api_key else None
-        if self.openrouter_api_key:
-            return ("openrouter", self.checker_model)
-        return None
+        return (self.checker_base_url or self.llm_base_url, self.checker_api_key or self.llm_api_key, self.checker_model)
 
     @property
     def checker_available(self) -> bool:
         return self.checker is not None
 
-    @property
-    def allowed_unsafe_authors(self) -> set[str]:
-        names = {n.strip().lower() for n in self.unsafe_allowed_authors.split(",") if n.strip()}
-        return names or {self.target_repo.split("/")[0].lower()}
+    def repo_allowed(self, repo: str) -> bool:
+        names = {n.strip().lower() for n in self.allowed_repos.split(",") if n.strip()}
+        return "*" in names or repo.lower() in names
 
 
 settings = Settings()
